@@ -5,6 +5,7 @@ import {
   aiRuns,
   auditEvents,
   automationJobs,
+  clients,
   knowledgeEdges,
   knowledgeItems,
   learningCycles,
@@ -127,6 +128,21 @@ export async function captureCompletedProject(
     .get();
   if (!project) throw new Error("Completed project was not found");
 
+  if (project.status === "test") return;
+  if (project.clientId) {
+    const client = await db
+      .select({ status: clients.status })
+      .from(clients)
+      .where(
+        and(
+          eq(clients.workspaceId, workspaceId),
+          eq(clients.id, project.clientId),
+        ),
+      )
+      .get();
+    if (client?.status === "test") return;
+  }
+
   const tags = (() => {
     try {
       return JSON.parse(project.styleTagsJson) as string[];
@@ -190,7 +206,7 @@ export async function runLearningCycle(
   });
 
   try {
-    const [allObservations, completedProjects, existingPatterns] =
+    const [allObservations, completedProjectRows, testClientRows, existingPatterns] =
       await Promise.all([
         db
           .select()
@@ -206,11 +222,26 @@ export async function runLearningCycle(
             ),
           ),
         db
+          .select({ id: clients.id })
+          .from(clients)
+          .where(
+            and(
+              eq(clients.workspaceId, workspaceId),
+              eq(clients.status, "test"),
+            ),
+          ),
+        db
           .select()
           .from(patterns)
           .where(eq(patterns.workspaceId, workspaceId)),
       ]);
 
+    const testClientIds = new Set(testClientRows.map((item) => item.id));
+    const completedProjects = completedProjectRows.filter(
+      (item) =>
+        item.status !== "test" &&
+        (!item.clientId || !testClientIds.has(item.clientId)),
+    );
     const completedIds = new Set(completedProjects.map((item) => item.id));
     const eligible = allObservations.filter(
       (item) =>
@@ -270,8 +301,7 @@ export async function runLearningCycle(
         confidenceBps,
       });
       const sample = parseObject(evidenceRows[0].valueJson);
-      const label =
-        String(sample.label || patternKey.split(":").at(-1) || patternKey);
+      const label = String(sample.label || patternKey.split(":").at(-1) || patternKey);
       const existing = existingPatterns.find(
         (item) => item.patternKey === patternKey,
       );
@@ -418,8 +448,7 @@ export async function runLearningCycle(
           patternId,
           actionType: "internal_workflow_template",
           title: String(
-            sample.recommendation ||
-              `Create a reusable workflow for ${label}`,
+            sample.recommendation || `Create a reusable workflow for ${label}`,
           ),
           rationale: `${whyItMatters} Supported by ${distinctProjects.size} completed projects and ${distinctClients.size} clients.`,
           evidenceJson: JSON.stringify({
@@ -462,7 +491,7 @@ export async function runLearningCycle(
       system:
         "Summarize only supplied evidence. Do not invent clients, projects, outcomes, or causal claims.",
       context: {
-        observations: allObservations.length,
+        observations: eligible.length,
         patternsEvaluated: grouped.size,
         patternsPromoted: promoted,
         recommendationsCreated: createdRecommendations,
@@ -475,7 +504,7 @@ export async function runLearningCycle(
         .update(learningCycles)
         .set({
           status: "succeeded",
-          observationsProcessed: allObservations.length,
+          observationsProcessed: eligible.length,
           patternsEvaluated: grouped.size,
           patternsPromoted: promoted,
           recommendationsCreated: createdRecommendations,
@@ -502,7 +531,7 @@ export async function runLearningCycle(
         recommendation: model.summary,
         evidenceJson: JSON.stringify({
           cycleId,
-          observations: allObservations.length,
+          observations: eligible.length,
           patternsEvaluated: grouped.size,
           patternsPromoted: promoted,
         }),
@@ -556,7 +585,7 @@ export async function runLearningCycle(
       cycleId,
       runId,
       summary,
-      observationsProcessed: allObservations.length,
+      observationsProcessed: eligible.length,
       patternsEvaluated: grouped.size,
       patternsPromoted: promoted,
       recommendationsCreated: createdRecommendations,

@@ -20,6 +20,33 @@ import {
 } from "../_lib";
 import { captureAutomationSignal } from "../../../lib/automation-engine";
 
+const DUPLICATE_CREATE_WINDOW_MS = 30_000;
+
+type ApprovalBinding = {
+  assetId: string;
+  originalName?: string;
+  version?: number;
+  sha256?: string;
+};
+
+function parseApprovalBinding(value: string): ApprovalBinding | null {
+  try {
+    const parsed = JSON.parse(value) as Partial<ApprovalBinding> | null;
+    if (!parsed || typeof parsed.assetId !== "string" || !parsed.assetId) {
+      return null;
+    }
+    return {
+      assetId: parsed.assetId,
+      originalName:
+        typeof parsed.originalName === "string" ? parsed.originalName : undefined,
+      version: typeof parsed.version === "number" ? parsed.version : undefined,
+      sha256: typeof parsed.sha256 === "string" ? parsed.sha256 : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export async function GET(request: Request) {
   try {
     const token = new URL(request.url).searchParams.get("token");
@@ -79,18 +106,30 @@ export async function GET(request: Request) {
           .orderBy(clientMessages.createdAt),
       ]);
 
+    if (!client) return jsonError("Client not found", 404);
+
     const projectIds = projectRows.map((project) => project.id);
-    const [approvalRows, assetRows, updateRows] = projectIds.length
+    const [approvalRows, allAssetRows, updateRows] = projectIds.length
       ? await Promise.all([
           db
             .select()
             .from(approvals)
-            .where(inArray(approvals.projectId, projectIds))
+            .where(
+              and(
+                inArray(approvals.projectId, projectIds),
+                eq(approvals.workspaceId, access.workspaceId),
+              ),
+            )
             .orderBy(desc(approvals.createdAt)),
           db
             .select()
             .from(assets)
-            .where(inArray(assets.projectId, projectIds))
+            .where(
+              and(
+                inArray(assets.projectId, projectIds),
+                eq(assets.workspaceId, access.workspaceId),
+              ),
+            )
             .orderBy(desc(assets.createdAt)),
           db
             .select()
@@ -105,6 +144,27 @@ export async function GET(request: Request) {
         ])
       : [[], [], []];
 
+    const approvalBindingById = new Map(
+      approvalRows.map((approval) => [
+        approval.id,
+        parseApprovalBinding(approval.payloadRedactedJson),
+      ]),
+    );
+    const approvalBoundAssetIds = new Set(
+      [...approvalBindingById.values()]
+        .filter((binding): binding is ApprovalBinding => Boolean(binding))
+        .map((binding) => binding.assetId),
+    );
+
+    // Client uploads are visible to their client. Owner uploads remain private
+    // unless an approval record explicitly binds that exact immutable asset.
+    const assetRows = allAssetRows.filter(
+      (asset) =>
+        !asset.deletedAt &&
+        (asset.sourceType === "client_upload" ||
+          approvalBoundAssetIds.has(asset.id)),
+    );
+
     if (access.invitation) {
       await db
         .update(portalInvitations)
@@ -112,14 +172,92 @@ export async function GET(request: Request) {
         .where(eq(portalInvitations.id, access.invitation.id));
     }
 
+    // Explicit client-facing DTOs: never return raw owner records from this
+    // route. Studio notes, internal creative direction, next actions, private
+    // appointment notes, AI metadata, approval evidence, and other owner-only
+    // fields stay on the owner side of the boundary.
+    const publicClient = {
+      id: client.id,
+      firstName: client.firstName,
+      lastName: client.lastName,
+      email: client.email,
+      phone: client.phone,
+      preferredChannel: client.preferredChannel,
+      status: client.status,
+      notes: null,
+      createdAt: client.createdAt,
+      updatedAt: client.updatedAt,
+    };
+    const publicProjects = projectRows.map((project) => ({
+      id: project.id,
+      clientId: project.clientId,
+      title: project.title,
+      lifecyclePhase: project.lifecyclePhase,
+      status: project.status,
+      priority: project.priority,
+      placement: project.placement,
+      sizeDescription: project.sizeDescription,
+      styleTagsJson: project.styleTagsJson,
+      budgetMinCents: project.budgetMinCents,
+      budgetMaxCents: project.budgetMaxCents,
+      targetDate: project.targetDate,
+      nextAction: null,
+      nextActionAt: null,
+      summary: null,
+      updatedAt: project.updatedAt,
+    }));
+    const publicAppointments = appointmentRows.map((appointment) => ({
+      id: appointment.id,
+      clientId: appointment.clientId,
+      projectId: appointment.projectId,
+      appointmentType: appointment.appointmentType,
+      startsAt: appointment.startsAt,
+      endsAt: appointment.endsAt,
+      status: appointment.status,
+      location: appointment.location,
+      notes: null,
+    }));
+    const publicApprovals = approvalRows.map((approval) => {
+      const binding = approvalBindingById.get(approval.id) ?? null;
+      return {
+        id: approval.id,
+        projectId: approval.projectId,
+        category: approval.category,
+        subject: approval.subject,
+        summary: "Review this item and choose approve or request revision.",
+        riskLevel: approval.riskLevel,
+        status: approval.status,
+        decisionReason: approval.decisionReason,
+        createdAt: approval.createdAt,
+        asset: binding
+          ? {
+              id: binding.assetId,
+              originalName: binding.originalName ?? null,
+              version: binding.version ?? null,
+            }
+          : null,
+      };
+    });
+    const publicAssets = assetRows.map((asset) => ({
+      id: asset.id,
+      clientId: asset.clientId,
+      projectId: asset.projectId,
+      originalName: asset.originalName,
+      mediaType: asset.mediaType,
+      mimeType: asset.mimeType,
+      byteSize: asset.byteSize,
+      sourceType: asset.sourceType,
+      createdAt: asset.createdAt,
+    }));
+
     return Response.json({
       workspace,
-      client,
-      projects: projectRows,
-      appointments: appointmentRows,
-      approvals: approvalRows,
+      client: publicClient,
+      projects: publicProjects,
+      appointments: publicAppointments,
+      approvals: publicApprovals,
       messages: messageRows,
-      assets: assetRows,
+      assets: publicAssets,
       updates: updateRows,
       access: {
         expiresAt: access.invitation?.expiresAt ?? null,
@@ -150,69 +288,127 @@ export async function POST(request: Request) {
     if (!access) return jsonError("Portal access is invalid or expired", 401);
     const db = getDb();
     const now = new Date().toISOString();
+    const client = await db
+      .select({ id: clients.id, status: clients.status })
+      .from(clients)
+      .where(
+        and(
+          eq(clients.id, access.clientId),
+          eq(clients.workspaceId, access.workspaceId),
+        ),
+      )
+      .get();
+    if (!client) return jsonError("Client not found", 404);
 
     if (payload.action === "message") {
-      if (!payload.body?.trim()) return jsonError("Message cannot be empty");
-      if (payload.projectId) {
-        const project = await db
-          .select({ id: projects.id })
+      const body = payload.body?.trim() || "";
+      if (!body) return jsonError("Message cannot be empty");
+
+      const projectId = payload.projectId || null;
+      let project: { id: string; status: string } | undefined;
+      if (projectId) {
+        project = await db
+          .select({ id: projects.id, status: projects.status })
           .from(projects)
           .where(
             and(
-              eq(projects.id, payload.projectId),
+              eq(projects.id, projectId),
               eq(projects.clientId, access.clientId),
+              eq(projects.workspaceId, access.workspaceId),
             ),
           )
           .get();
         if (!project) return jsonError("Project not found", 404);
       }
+
+      const recentMatch = await db
+        .select()
+        .from(clientMessages)
+        .where(
+          and(
+            eq(clientMessages.workspaceId, access.workspaceId),
+            eq(clientMessages.clientId, access.clientId),
+            eq(clientMessages.senderType, "client"),
+          ),
+        )
+        .orderBy(desc(clientMessages.createdAt))
+        .get();
+      if (recentMatch) {
+        const createdAt = Date.parse(recentMatch.createdAt);
+        const isRecent =
+          Number.isFinite(createdAt) &&
+          Date.now() - createdAt >= 0 &&
+          Date.now() - createdAt <= DUPLICATE_CREATE_WINDOW_MS;
+        if (
+          isRecent &&
+          recentMatch.projectId === projectId &&
+          recentMatch.body === body
+        ) {
+          return Response.json({
+            id: recentMatch.id,
+            status: "duplicate_suppressed",
+            duplicateSuppressed: true,
+          });
+        }
+      }
+
       const messageId = makeId("msg");
+      const isTestData = client.status === "test" || project?.status === "test";
       await db.batch([
         db.insert(clientMessages).values({
           id: messageId,
-          workspaceId: WORKSPACE_ID,
+          workspaceId: access.workspaceId,
           clientId: access.clientId,
-          projectId: payload.projectId || null,
+          projectId,
           senderType: "client",
           senderId: access.clientId,
-          body: payload.body.trim(),
+          body,
           status: "sent",
           createdAt: now,
         }),
         db.insert(auditEvents).values({
           id: makeId("audit"),
-          workspaceId: WORKSPACE_ID,
+          workspaceId: access.workspaceId,
           actorType: "client",
           actorId: access.clientId,
           action: "portal.message_sent",
           targetType: "project",
-          targetId: payload.projectId || null,
+          targetId: projectId,
           riskLevel: "low",
           outcome: "succeeded",
-          metadataJson: JSON.stringify({ contentCaptured: false }),
+          metadataJson: JSON.stringify({
+            contentCaptured: false,
+            testData: isTestData,
+          }),
           occurredAt: now,
         }),
       ]);
-      await captureAutomationSignal(
-        {
-          workspaceId: WORKSPACE_ID,
-          eventType: "client_message_received",
-          sourceType: "message",
-          sourceId: messageId,
-          projectId: payload.projectId || null,
-          clientId: access.clientId,
-          category: "communication",
-          signalKey: "communication.client_message",
-          value: {
-            direction: "inbound",
-            characterCount: payload.body.trim().length,
-            contentCaptured: false,
+
+      if (!isTestData) {
+        await captureAutomationSignal(
+          {
+            workspaceId: access.workspaceId,
+            eventType: "client_message_received",
+            sourceType: "message",
+            sourceId: messageId,
+            projectId,
+            clientId: access.clientId,
+            category: "communication",
+            signalKey: "communication.client_message",
+            value: {
+              direction: "inbound",
+              characterCount: body.length,
+              contentCaptured: false,
+            },
+            priority: 90,
           },
-          priority: 90,
-        },
-        db,
+          db,
+        );
+      }
+      return Response.json(
+        { id: messageId, status: isTestData ? "test_sent" : "sent" },
+        { status: 201 },
       );
-      return Response.json({ id: messageId, status: "sent" }, { status: 201 });
     }
 
     if (payload.action === "approval") {
@@ -226,7 +422,10 @@ export async function POST(request: Request) {
         .select({
           id: approvals.id,
           projectId: approvals.projectId,
+          status: approvals.status,
+          payloadHash: approvals.payloadHash,
           clientId: projects.clientId,
+          projectStatus: projects.status,
         })
         .from(approvals)
         .leftJoin(projects, eq(approvals.projectId, projects.id))
@@ -240,6 +439,12 @@ export async function POST(request: Request) {
       if (!approval || approval.clientId !== access.clientId) {
         return jsonError("Approval not found", 404);
       }
+      if (approval.status !== "pending") {
+        return jsonError("This approval has already been decided", 409);
+      }
+
+      const isTestData =
+        client.status === "test" || approval.projectStatus === "test";
       await db.batch([
         db
           .update(approvals)
@@ -250,10 +455,15 @@ export async function POST(request: Request) {
             decidedAt: now,
             updatedAt: now,
           })
-          .where(eq(approvals.id, payload.approvalId)),
+          .where(
+            and(
+              eq(approvals.id, payload.approvalId),
+              eq(approvals.status, "pending"),
+            ),
+          ),
         db.insert(auditEvents).values({
           id: makeId("audit"),
-          workspaceId: WORKSPACE_ID,
+          workspaceId: access.workspaceId,
           actorType: "client",
           actorId: access.clientId,
           action: `approval.${payload.decision}`,
@@ -261,28 +471,35 @@ export async function POST(request: Request) {
           targetId: payload.approvalId,
           riskLevel: "medium",
           outcome: "succeeded",
-          metadataJson: "{}",
+          metadataJson: JSON.stringify({
+            payloadHash: approval.payloadHash,
+            testData: isTestData,
+          }),
           occurredAt: now,
         }),
       ]);
-      await captureAutomationSignal(
-        {
-          workspaceId: WORKSPACE_ID,
-          eventType: "approval_decided",
-          sourceType: "approval",
-          sourceId: approval.id,
-          projectId: approval.projectId,
-          clientId: access.clientId,
-          category: "approval",
-          signalKey: `approval.client_decision:${payload.decision}`,
-          value: {
-            decision: payload.decision,
-            decisionBy: "client",
+
+      if (!isTestData) {
+        await captureAutomationSignal(
+          {
+            workspaceId: access.workspaceId,
+            eventType: "approval_decided",
+            sourceType: "approval",
+            sourceId: approval.id,
+            projectId: approval.projectId,
+            clientId: access.clientId,
+            category: "approval",
+            signalKey: `approval.client_decision:${payload.decision}`,
+            value: {
+              decision: payload.decision,
+              decisionBy: "client",
+              payloadHash: approval.payloadHash,
+            },
+            priority: 95,
           },
-          priority: 95,
-        },
-        db,
-      );
+          db,
+        );
+      }
       return Response.json({ status: payload.decision });
     }
 

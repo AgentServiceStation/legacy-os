@@ -27,9 +27,10 @@ export async function GET(request: Request) {
   try {
     const access = await requireOwner(request);
     const db = getDb();
+    const includeTestData =
+      new URL(request.url).searchParams.get("includeTestData") === "true";
     const email = access.user!.email || actorFrom(request);
-    const displayName =
-      access.user!.displayName || displayNameFrom(request);
+    const displayName = access.user!.displayName || displayNameFrom(request);
 
     await db
       .insert(workspaces)
@@ -63,13 +64,13 @@ export async function GET(request: Request) {
     const [
       workspace,
       owner,
-      clientRows,
-      projectRows,
-      appointmentRows,
-      approvalRows,
-      messageRows,
-      assetRows,
-      runRows,
+      rawClientRows,
+      rawProjectRows,
+      rawAppointmentRows,
+      rawApprovalRows,
+      rawMessageRows,
+      rawAssetRows,
+      rawRunRows,
       auditRows,
       notificationRows,
     ] = await Promise.all([
@@ -167,6 +168,45 @@ export async function GET(request: Request) {
         .limit(50),
     ]);
 
+    const clientRows = includeTestData
+      ? rawClientRows
+      : rawClientRows.filter((client) => client.status !== "test");
+    const visibleClientIds = new Set(clientRows.map((client) => client.id));
+    const projectRows = includeTestData
+      ? rawProjectRows
+      : rawProjectRows.filter(
+          (project) =>
+            project.status !== "test" &&
+            (!project.clientId || visibleClientIds.has(project.clientId)),
+        );
+    const visibleProjectIds = new Set(projectRows.map((project) => project.id));
+
+    const linkedToVisibleReality = (
+      clientId: string | null,
+      projectId: string | null,
+    ) => {
+      if (includeTestData) return true;
+      if (clientId && !visibleClientIds.has(clientId)) return false;
+      if (projectId && !visibleProjectIds.has(projectId)) return false;
+      return true;
+    };
+
+    const appointmentRows = rawAppointmentRows.filter((row) =>
+      linkedToVisibleReality(row.clientId, row.projectId),
+    );
+    const approvalRows = rawApprovalRows.filter(
+      (row) => includeTestData || !row.projectId || visibleProjectIds.has(row.projectId),
+    );
+    const messageRows = rawMessageRows.filter((row) =>
+      linkedToVisibleReality(row.clientId, row.projectId),
+    );
+    const assetRows = rawAssetRows.filter((row) =>
+      linkedToVisibleReality(row.clientId, row.projectId),
+    );
+    const runRows = rawRunRows.filter(
+      (row) => includeTestData || !row.projectId || visibleProjectIds.has(row.projectId),
+    );
+
     return Response.json({
       workspace,
       owner,
@@ -179,6 +219,11 @@ export async function GET(request: Request) {
       aiRuns: runRows,
       auditEvents: auditRows,
       notifications: notificationRows,
+      dataPolicy: {
+        includeTestData,
+        excludedTestClients: rawClientRows.length - clientRows.length,
+        excludedTestProjects: rawProjectRows.length - projectRows.length,
+      },
     });
   } catch (error) {
     return routeError(error, "Unable to load workspace");

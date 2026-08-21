@@ -1,6 +1,12 @@
 import { and, eq } from "drizzle-orm";
 import { getDb } from "../../../db";
-import { approvals, auditEvents, projects } from "../../../db/schema";
+import {
+  approvals,
+  assets,
+  auditEvents,
+  clients,
+  projects,
+} from "../../../db/schema";
 import { makeId, requireOwner, routeError } from "../_lib";
 import { captureAutomationSignal } from "../../../lib/automation-engine";
 
@@ -17,6 +23,7 @@ export async function POST(request: Request) {
       subject?: string;
       reason?: string;
       projectId?: string;
+      assetId?: string;
       summary?: string;
       riskLevel?: string;
     };
@@ -28,8 +35,14 @@ export async function POST(request: Request) {
 
     if (!payload.approvalId && payload.projectId && payload.subject?.trim()) {
       const project = await db
-        .select({ id: projects.id })
+        .select({
+          id: projects.id,
+          status: projects.status,
+          clientId: projects.clientId,
+          clientStatus: clients.status,
+        })
         .from(projects)
+        .leftJoin(clients, eq(projects.clientId, clients.id))
         .where(
           and(
             eq(projects.id, payload.projectId),
@@ -40,7 +53,84 @@ export async function POST(request: Request) {
       if (!project) {
         return Response.json({ error: "Project not found" }, { status: 404 });
       }
+
+      const category = payload.category || "client_approval";
+      let boundAsset:
+        | {
+            id: string;
+            originalName: string;
+            sha256: string;
+            version: number;
+          }
+        | undefined;
+
+      if (category === "design") {
+        if (!payload.assetId) {
+          return Response.json(
+            { error: "Select the exact design file before requesting approval" },
+            { status: 400 },
+          );
+        }
+        boundAsset = await db
+          .select({
+            id: assets.id,
+            originalName: assets.originalName,
+            sha256: assets.sha256,
+            version: assets.version,
+          })
+          .from(assets)
+          .where(
+            and(
+              eq(assets.id, payload.assetId),
+              eq(assets.projectId, payload.projectId),
+              eq(assets.workspaceId, DEFAULT_WORKSPACE_ID),
+            ),
+          )
+          .get();
+        if (!boundAsset) {
+          return Response.json(
+            { error: "Design file not found for this project" },
+            { status: 404 },
+          );
+        }
+      }
+
+      const payloadHash = boundAsset?.sha256 || null;
+      if (payloadHash) {
+        const existingPending = await db
+          .select({ id: approvals.id })
+          .from(approvals)
+          .where(
+            and(
+              eq(approvals.workspaceId, DEFAULT_WORKSPACE_ID),
+              eq(approvals.projectId, payload.projectId),
+              eq(approvals.category, category),
+              eq(approvals.payloadHash, payloadHash),
+              eq(approvals.status, "pending"),
+            ),
+          )
+          .get();
+        if (existingPending) {
+          return Response.json({
+            approvalId: existingPending.id,
+            status: "duplicate_suppressed",
+            duplicateSuppressed: true,
+          });
+        }
+      }
+
       const approvalId = makeId("approval");
+      const binding = boundAsset
+        ? {
+            assetId: boundAsset.id,
+            originalName: boundAsset.originalName,
+            version: boundAsset.version,
+            sha256: boundAsset.sha256,
+          }
+        : null;
+      const isTestData =
+        project.status === "test" || project.clientStatus === "test";
+
       await db.batch([
         db.insert(approvals).values({
           id: approvalId,
@@ -48,12 +138,24 @@ export async function POST(request: Request) {
           projectId: payload.projectId,
           requestedByType: "owner",
           requestedById: actor,
-          category: payload.category || "client_approval",
+          category,
           actionType: "review",
           subject: payload.subject.trim(),
           summary: payload.summary?.trim() || "Client review requested.",
-          payloadHash: approvalId,
-          evidenceJson: "[]",
+          payloadHash: payloadHash || approvalId,
+          payloadRedactedJson: JSON.stringify(binding || {}),
+          evidenceJson: JSON.stringify(
+            binding
+              ? [
+                  {
+                    type: "asset",
+                    id: binding.assetId,
+                    version: binding.version,
+                    sha256: binding.sha256,
+                  },
+                ]
+              : [],
+          ),
           riskLevel: payload.riskLevel || "medium",
           reversibility: "reversible",
           status: "pending",
@@ -70,30 +172,47 @@ export async function POST(request: Request) {
           targetId: approvalId,
           riskLevel: payload.riskLevel || "medium",
           outcome: "recorded",
-          metadataJson: JSON.stringify({ projectId: payload.projectId }),
+          metadataJson: JSON.stringify({
+            projectId: payload.projectId,
+            assetId: boundAsset?.id || null,
+            assetSha256: boundAsset?.sha256 || null,
+            testData: isTestData,
+          }),
           occurredAt: now,
         }),
       ]);
-      await captureAutomationSignal(
-        {
-          workspaceId: DEFAULT_WORKSPACE_ID,
-          eventType: "approval_requested",
-          sourceType: "approval",
-          sourceId: approvalId,
-          projectId: payload.projectId,
-          category: "approval",
-          signalKey: `approval.requested:${payload.category || "client_approval"}`,
-          value: {
-            category: payload.category || "client_approval",
-            riskLevel: payload.riskLevel || "medium",
-            status: "pending",
+
+      if (!isTestData) {
+        await captureAutomationSignal(
+          {
+            workspaceId: DEFAULT_WORKSPACE_ID,
+            eventType: "approval_requested",
+            sourceType: "approval",
+            sourceId: approvalId,
+            projectId: payload.projectId,
+            clientId: project.clientId,
+            category: "approval",
+            signalKey: `approval.requested:${category}`,
+            value: {
+              category,
+              riskLevel: payload.riskLevel || "medium",
+              status: "pending",
+              assetId: boundAsset?.id || null,
+              assetVersion: boundAsset?.version || null,
+              assetSha256: boundAsset?.sha256 || null,
+            },
+            priority: 85,
           },
-          priority: 85,
-        },
-        db,
-      );
+          db,
+        );
+      }
+
       return Response.json(
-        { approvalId, status: "pending" },
+        {
+          approvalId,
+          status: isTestData ? "test_pending" : "pending",
+          binding,
+        },
         { status: 201 },
       );
     }
@@ -122,6 +241,33 @@ export async function POST(request: Request) {
     if (!existing) {
       return Response.json({ error: "Approval not found" }, { status: 404 });
     }
+    if (existing.status !== "pending") {
+      return Response.json(
+        { error: "This approval has already been decided" },
+        { status: 409 },
+      );
+    }
+
+    const projectContext = existing.projectId
+      ? await db
+          .select({
+            projectStatus: projects.status,
+            clientStatus: clients.status,
+            clientId: projects.clientId,
+          })
+          .from(projects)
+          .leftJoin(clients, eq(projects.clientId, clients.id))
+          .where(
+            and(
+              eq(projects.id, existing.projectId),
+              eq(projects.workspaceId, DEFAULT_WORKSPACE_ID),
+            ),
+          )
+          .get()
+      : null;
+    const isTestData =
+      projectContext?.projectStatus === "test" ||
+      projectContext?.clientStatus === "test";
 
     await db.batch([
       db
@@ -151,29 +297,36 @@ export async function POST(request: Request) {
         outcome: "recorded",
         correlationId: null,
         metadataJson: JSON.stringify({
-          category: payload.category,
-          subject: payload.subject,
+          category: existing.category,
+          subject: existing.subject,
+          payloadHash: existing.payloadHash,
+          testData: isTestData,
         }),
       }),
     ]);
-    await captureAutomationSignal(
-      {
-        workspaceId: DEFAULT_WORKSPACE_ID,
-        eventType: "approval_decided",
-        sourceType: "approval",
-        sourceId: existing.id,
-        projectId: existing.projectId,
-        category: "approval",
-        signalKey: `approval.decision:${payload.decision}`,
-        value: {
-          category: existing.category,
-          riskLevel: existing.riskLevel,
-          decision: payload.decision,
+
+    if (!isTestData) {
+      await captureAutomationSignal(
+        {
+          workspaceId: DEFAULT_WORKSPACE_ID,
+          eventType: "approval_decided",
+          sourceType: "approval",
+          sourceId: existing.id,
+          projectId: existing.projectId,
+          clientId: projectContext?.clientId ?? null,
+          category: "approval",
+          signalKey: `approval.decision:${payload.decision}`,
+          value: {
+            category: existing.category,
+            riskLevel: existing.riskLevel,
+            decision: payload.decision,
+            payloadHash: existing.payloadHash,
+          },
+          priority: 80,
         },
-        priority: 80,
-      },
-      db,
-    );
+        db,
+      );
+    }
 
     return Response.json({
       approvalId: payload.approvalId,
