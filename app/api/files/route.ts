@@ -152,6 +152,11 @@ export async function GET(request: Request) {
       if (row.clientId !== clientAccess.clientId) {
         return jsonError("Portal access is invalid or expired", 401);
       }
+      // Owner uploads are private by default. A later explicit share/version
+      // binding flow can expose a specific immutable owner asset to the client.
+      if (row.sourceType !== "client_upload") {
+        return jsonError("This file has not been shared with the client", 403);
+      }
     } else {
       await requireOwner(request);
     }
