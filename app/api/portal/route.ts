@@ -79,18 +79,33 @@ export async function GET(request: Request) {
           .orderBy(clientMessages.createdAt),
       ]);
 
+    if (!client) return jsonError("Client not found", 404);
+
     const projectIds = projectRows.map((project) => project.id);
     const [approvalRows, assetRows, updateRows] = projectIds.length
       ? await Promise.all([
           db
             .select()
             .from(approvals)
-            .where(inArray(approvals.projectId, projectIds))
+            .where(
+              and(
+                inArray(approvals.projectId, projectIds),
+                eq(approvals.workspaceId, access.workspaceId),
+              ),
+            )
             .orderBy(desc(approvals.createdAt)),
+          // Until explicit owner-side sharing/version binding is implemented,
+          // only files the client uploaded themselves cross the portal boundary.
           db
             .select()
             .from(assets)
-            .where(inArray(assets.projectId, projectIds))
+            .where(
+              and(
+                inArray(assets.projectId, projectIds),
+                eq(assets.workspaceId, access.workspaceId),
+                eq(assets.sourceType, "client_upload"),
+              ),
+            )
             .orderBy(desc(assets.createdAt)),
           db
             .select()
@@ -112,14 +127,82 @@ export async function GET(request: Request) {
         .where(eq(portalInvitations.id, access.invitation.id));
     }
 
+    // This is an explicit client-facing DTO. Never return raw owner records from
+    // this route: studio notes, internal project summaries, next actions, private
+    // appointment notes, AI metadata, approval evidence, and other owner-only
+    // fields must remain on the owner side of the boundary.
+    const publicClient = {
+      id: client.id,
+      firstName: client.firstName,
+      lastName: client.lastName,
+      email: client.email,
+      phone: client.phone,
+      preferredChannel: client.preferredChannel,
+      status: client.status,
+      notes: null,
+      createdAt: client.createdAt,
+      updatedAt: client.updatedAt,
+    };
+    const publicProjects = projectRows.map((project) => ({
+      id: project.id,
+      clientId: project.clientId,
+      title: project.title,
+      lifecyclePhase: project.lifecyclePhase,
+      status: project.status,
+      priority: project.priority,
+      placement: project.placement,
+      sizeDescription: project.sizeDescription,
+      styleTagsJson: project.styleTagsJson,
+      budgetMinCents: project.budgetMinCents,
+      budgetMaxCents: project.budgetMaxCents,
+      targetDate: project.targetDate,
+      nextAction: null,
+      nextActionAt: null,
+      summary: null,
+      updatedAt: project.updatedAt,
+    }));
+    const publicAppointments = appointmentRows.map((appointment) => ({
+      id: appointment.id,
+      clientId: appointment.clientId,
+      projectId: appointment.projectId,
+      appointmentType: appointment.appointmentType,
+      startsAt: appointment.startsAt,
+      endsAt: appointment.endsAt,
+      status: appointment.status,
+      location: appointment.location,
+      notes: null,
+    }));
+    const publicApprovals = approvalRows.map((approval) => ({
+      id: approval.id,
+      projectId: approval.projectId,
+      category: approval.category,
+      subject: approval.subject,
+      summary: "Review this item and choose approve or request revision.",
+      riskLevel: approval.riskLevel,
+      status: approval.status,
+      decisionReason: approval.decisionReason,
+      createdAt: approval.createdAt,
+    }));
+    const publicAssets = assetRows.map((asset) => ({
+      id: asset.id,
+      clientId: asset.clientId,
+      projectId: asset.projectId,
+      originalName: asset.originalName,
+      mediaType: asset.mediaType,
+      mimeType: asset.mimeType,
+      byteSize: asset.byteSize,
+      sourceType: asset.sourceType,
+      createdAt: asset.createdAt,
+    }));
+
     return Response.json({
       workspace,
-      client,
-      projects: projectRows,
-      appointments: appointmentRows,
-      approvals: approvalRows,
+      client: publicClient,
+      projects: publicProjects,
+      appointments: publicAppointments,
+      approvals: publicApprovals,
       messages: messageRows,
-      assets: assetRows,
+      assets: publicAssets,
       updates: updateRows,
       access: {
         expiresAt: access.invitation?.expiresAt ?? null,
@@ -161,6 +244,7 @@ export async function POST(request: Request) {
             and(
               eq(projects.id, payload.projectId),
               eq(projects.clientId, access.clientId),
+              eq(projects.workspaceId, access.workspaceId),
             ),
           )
           .get();
@@ -226,6 +310,7 @@ export async function POST(request: Request) {
         .select({
           id: approvals.id,
           projectId: approvals.projectId,
+          status: approvals.status,
           clientId: projects.clientId,
         })
         .from(approvals)
@@ -239,6 +324,9 @@ export async function POST(request: Request) {
         .get();
       if (!approval || approval.clientId !== access.clientId) {
         return jsonError("Approval not found", 404);
+      }
+      if (approval.status !== "pending") {
+        return jsonError("This approval has already been decided", 409);
       }
       await db.batch([
         db
