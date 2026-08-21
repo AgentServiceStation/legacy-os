@@ -207,9 +207,14 @@ export async function POST(request: Request) {
         db,
       );
 
-      // Healing observations are outcome evidence. They become eligible for
-      // broader learning only when the project itself later satisfies the
-      // learning engine's real-data/completion rules.
+      // qualityBps in the value is the tattoo/healing outcome score. The
+      // observation quality below is confidence in the evidence itself and is
+      // intentionally independent of whether the outcome was good or bad.
+      const evidenceQualityBps = payload.assetId
+        ? 9000
+        : payload.artistAssessment?.trim() && payload.clientFeedback?.trim()
+          ? 8200
+          : 7000;
       await captureObservation(
         {
           workspaceId: WORKSPACE_ID,
@@ -225,7 +230,7 @@ export async function POST(request: Request) {
             touchupRequired: Boolean(payload.touchupRequired),
             hasPhoto: Boolean(payload.assetId),
           },
-          qualityBps: payload.qualityBps ?? 7000,
+          qualityBps: evidenceQualityBps,
           occurredAt: observedAt,
         },
         db,
