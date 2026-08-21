@@ -13,6 +13,7 @@ import { captureCompletedProject } from "../../../lib/intelligence-engine";
 import { captureAutomationSignal } from "../../../lib/automation-engine";
 
 const DUPLICATE_CREATE_WINDOW_MS = 30_000;
+const PROJECT_STATUSES = new Set(["active", "completed", "archived", "test"]);
 
 function normalizeTags(style?: string) {
   return (
@@ -40,6 +41,7 @@ export async function POST(request: Request) {
       budgetMax?: number;
       targetDate?: string;
       nextAction?: string;
+      isTestData?: boolean;
     };
     if (!payload.clientId || !payload.title?.trim()) {
       return jsonError("A client and project title are required");
@@ -47,7 +49,7 @@ export async function POST(request: Request) {
 
     const db = getDb();
     const client = await db
-      .select({ id: clients.id })
+      .select({ id: clients.id, status: clients.status })
       .from(clients)
       .where(
         and(
@@ -73,6 +75,7 @@ export async function POST(request: Request) {
         : null;
     const targetDate = payload.targetDate || null;
     const nextAction = payload.nextAction?.trim() || "Complete project intake";
+    const status = payload.isTestData || client.status === "test" ? "test" : "active";
 
     // Mobile double taps, browser retries, and slow network responses must not
     // create a second business record. Suppress only a very recent project
@@ -98,6 +101,7 @@ export async function POST(request: Request) {
         Date.now() - createdAtMs >= 0 &&
         Date.now() - createdAtMs <= DUPLICATE_CREATE_WINDOW_MS;
       const samePayload =
+        recentMatch.status === status &&
         sameNullableText(recentMatch.placement, placement) &&
         recentMatch.styleTagsJson === styleTagsJson &&
         sameNullableText(recentMatch.summary, summary) &&
@@ -125,6 +129,7 @@ export async function POST(request: Request) {
         clientId: payload.clientId,
         title,
         lifecyclePhase: "consult",
+        status,
         placement,
         styleTagsJson,
         summary,
@@ -145,29 +150,39 @@ export async function POST(request: Request) {
         targetId: projectId,
         riskLevel: "low",
         outcome: "succeeded",
-        metadataJson: JSON.stringify({ clientId: payload.clientId }),
+        metadataJson: JSON.stringify({
+          clientId: payload.clientId,
+          testData: status === "test",
+        }),
         occurredAt: now,
       }),
     ]);
-    await captureAutomationSignal(
-      {
-        workspaceId: WORKSPACE_ID,
-        eventType: "project_created",
-        projectId,
-        clientId: payload.clientId,
-        sourceType: "project",
-        sourceId: projectId,
-        category: "workflow",
-        signalKey: "project.created",
-        value: {
-          lifecyclePhase: "consult",
-          placement,
-          styleTags,
+
+    if (status !== "test") {
+      await captureAutomationSignal(
+        {
+          workspaceId: WORKSPACE_ID,
+          eventType: "project_created",
+          projectId,
+          clientId: payload.clientId,
+          sourceType: "project",
+          sourceId: projectId,
+          category: "workflow",
+          signalKey: "project.created",
+          value: {
+            lifecyclePhase: "consult",
+            placement,
+            styleTags,
+          },
         },
-      },
-      db,
+        db,
+      );
+    }
+
+    return Response.json(
+      { id: projectId, status: status === "test" ? "test_created" : "created" },
+      { status: 201 },
     );
-    return Response.json({ id: projectId, status: "created" }, { status: 201 });
   } catch (error) {
     return routeError(error, "Unable to create project");
   }
@@ -198,6 +213,10 @@ export async function PATCH(request: Request) {
     ) {
       return jsonError("Lifecycle phase is invalid");
     }
+    if (payload.status && !PROJECT_STATUSES.has(payload.status)) {
+      return jsonError("Project status is invalid");
+    }
+
     const db = getDb();
     const existing = await db
       .select()
@@ -210,17 +229,24 @@ export async function PATCH(request: Request) {
       )
       .get();
     if (!existing) return jsonError("Project not found", 404);
+
     const now = new Date().toISOString();
     const actor = actorFrom(request);
     const nextPhase = payload.lifecyclePhase ?? existing.lifecyclePhase;
+    const nextStatus =
+      payload.status ??
+      (existing.status === "test"
+        ? "test"
+        : nextPhase === "complete"
+          ? "completed"
+          : existing.status);
+
     await db.batch([
       db
         .update(projects)
         .set({
           lifecyclePhase: nextPhase,
-          status:
-            payload.status ??
-            (nextPhase === "complete" ? "completed" : existing.status),
+          status: nextStatus,
           nextAction:
             payload.nextAction === undefined
               ? existing.nextAction
@@ -232,6 +258,7 @@ export async function PATCH(request: Request) {
           summary:
             payload.summary === undefined ? existing.summary : payload.summary,
           updatedAt: now,
+          archivedAt: nextStatus === "archived" ? now : null,
         })
         .where(eq(projects.id, existing.id)),
       db.insert(auditEvents).values({
@@ -247,43 +274,53 @@ export async function PATCH(request: Request) {
         metadataJson: JSON.stringify({
           priorPhase: existing.lifecyclePhase,
           nextPhase,
+          priorStatus: existing.status,
+          nextStatus,
         }),
         occurredAt: now,
       }),
     ]);
+
+    const isReal = nextStatus !== "test";
     if (
+      isReal &&
       nextPhase === "complete" &&
       existing.lifecyclePhase !== "complete"
     ) {
       await captureCompletedProject(WORKSPACE_ID, existing.id, db);
     }
-    await captureAutomationSignal(
-      {
-        workspaceId: WORKSPACE_ID,
-        eventType:
-          nextPhase === "complete"
-            ? "project_completed"
-            : `project_${nextPhase}`,
-        projectId: existing.id,
-        clientId: existing.clientId,
-        sourceType: "project",
-        sourceId: existing.id,
-        category: "workflow",
-        signalKey: `project.phase:${nextPhase}`,
-        value: {
-          priorPhase: existing.lifecyclePhase,
-          nextPhase,
-          nextAction: payload.nextAction ?? existing.nextAction,
+    if (isReal) {
+      await captureAutomationSignal(
+        {
+          workspaceId: WORKSPACE_ID,
+          eventType:
+            nextPhase === "complete"
+              ? "project_completed"
+              : `project_${nextPhase}`,
+          projectId: existing.id,
+          clientId: existing.clientId,
+          sourceType: "project",
+          sourceId: existing.id,
+          category: "workflow",
+          signalKey: `project.phase:${nextPhase}`,
+          value: {
+            priorPhase: existing.lifecyclePhase,
+            nextPhase,
+            nextAction: payload.nextAction ?? existing.nextAction,
+          },
+          priority: nextPhase === "complete" ? 95 : 70,
         },
-        priority: nextPhase === "complete" ? 95 : 70,
-      },
-      db,
-    );
+        db,
+      );
+    }
+
     return Response.json({
       id: existing.id,
       status: "updated",
+      projectStatus: nextStatus,
       lifecyclePhase: nextPhase,
-      learningQueued: true,
+      learningQueued:
+        isReal && nextPhase === "complete" && existing.lifecyclePhase !== "complete",
     });
   } catch (error) {
     return routeError(error, "Unable to update project");
