@@ -20,6 +20,31 @@ import {
 } from "../_lib";
 import { captureAutomationSignal } from "../../../lib/automation-engine";
 
+type ApprovalBinding = {
+  assetId: string;
+  originalName?: string;
+  version?: number;
+  sha256?: string;
+};
+
+function parseApprovalBinding(value: string): ApprovalBinding | null {
+  try {
+    const parsed = JSON.parse(value) as Partial<ApprovalBinding> | null;
+    if (!parsed || typeof parsed.assetId !== "string" || !parsed.assetId) {
+      return null;
+    }
+    return {
+      assetId: parsed.assetId,
+      originalName:
+        typeof parsed.originalName === "string" ? parsed.originalName : undefined,
+      version: typeof parsed.version === "number" ? parsed.version : undefined,
+      sha256: typeof parsed.sha256 === "string" ? parsed.sha256 : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export async function GET(request: Request) {
   try {
     const token = new URL(request.url).searchParams.get("token");
@@ -82,7 +107,7 @@ export async function GET(request: Request) {
     if (!client) return jsonError("Client not found", 404);
 
     const projectIds = projectRows.map((project) => project.id);
-    const [approvalRows, assetRows, updateRows] = projectIds.length
+    const [approvalRows, allAssetRows, updateRows] = projectIds.length
       ? await Promise.all([
           db
             .select()
@@ -94,8 +119,6 @@ export async function GET(request: Request) {
               ),
             )
             .orderBy(desc(approvals.createdAt)),
-          // Until explicit owner-side sharing/version binding is implemented,
-          // only files the client uploaded themselves cross the portal boundary.
           db
             .select()
             .from(assets)
@@ -103,7 +126,6 @@ export async function GET(request: Request) {
               and(
                 inArray(assets.projectId, projectIds),
                 eq(assets.workspaceId, access.workspaceId),
-                eq(assets.sourceType, "client_upload"),
               ),
             )
             .orderBy(desc(assets.createdAt)),
@@ -120,6 +142,27 @@ export async function GET(request: Request) {
         ])
       : [[], [], []];
 
+    const approvalBindingById = new Map(
+      approvalRows.map((approval) => [
+        approval.id,
+        parseApprovalBinding(approval.payloadRedactedJson),
+      ]),
+    );
+    const approvalBoundAssetIds = new Set(
+      [...approvalBindingById.values()]
+        .filter((binding): binding is ApprovalBinding => Boolean(binding))
+        .map((binding) => binding.assetId),
+    );
+
+    // Client uploads are visible to their client. Owner uploads remain private
+    // unless an approval record explicitly binds that exact immutable asset.
+    const assetRows = allAssetRows.filter(
+      (asset) =>
+        !asset.deletedAt &&
+        (asset.sourceType === "client_upload" ||
+          approvalBoundAssetIds.has(asset.id)),
+    );
+
     if (access.invitation) {
       await db
         .update(portalInvitations)
@@ -127,10 +170,10 @@ export async function GET(request: Request) {
         .where(eq(portalInvitations.id, access.invitation.id));
     }
 
-    // This is an explicit client-facing DTO. Never return raw owner records from
-    // this route: studio notes, internal project summaries, next actions, private
+    // Explicit client-facing DTOs: never return raw owner records from this
+    // route. Studio notes, internal creative direction, next actions, private
     // appointment notes, AI metadata, approval evidence, and other owner-only
-    // fields must remain on the owner side of the boundary.
+    // fields stay on the owner side of the boundary.
     const publicClient = {
       id: client.id,
       firstName: client.firstName,
@@ -172,17 +215,27 @@ export async function GET(request: Request) {
       location: appointment.location,
       notes: null,
     }));
-    const publicApprovals = approvalRows.map((approval) => ({
-      id: approval.id,
-      projectId: approval.projectId,
-      category: approval.category,
-      subject: approval.subject,
-      summary: "Review this item and choose approve or request revision.",
-      riskLevel: approval.riskLevel,
-      status: approval.status,
-      decisionReason: approval.decisionReason,
-      createdAt: approval.createdAt,
-    }));
+    const publicApprovals = approvalRows.map((approval) => {
+      const binding = approvalBindingById.get(approval.id) ?? null;
+      return {
+        id: approval.id,
+        projectId: approval.projectId,
+        category: approval.category,
+        subject: approval.subject,
+        summary: "Review this item and choose approve or request revision.",
+        riskLevel: approval.riskLevel,
+        status: approval.status,
+        decisionReason: approval.decisionReason,
+        createdAt: approval.createdAt,
+        asset: binding
+          ? {
+              id: binding.assetId,
+              originalName: binding.originalName ?? null,
+              version: binding.version ?? null,
+            }
+          : null,
+      };
+    });
     const publicAssets = assetRows.map((asset) => ({
       id: asset.id,
       clientId: asset.clientId,
