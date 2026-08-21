@@ -1,4 +1,4 @@
-import { and, eq } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import { getDb } from "../../../db";
 import {
   auditEvents,
@@ -7,7 +7,16 @@ import {
   projects,
 } from "../../../db/schema";
 import { captureAutomationSignal } from "../../../lib/automation-engine";
-import { actorFrom, jsonError, makeId, requireOwner, routeError, WORKSPACE_ID } from "../_lib";
+import {
+  actorFrom,
+  jsonError,
+  makeId,
+  requireOwner,
+  routeError,
+  WORKSPACE_ID,
+} from "../_lib";
+
+const DUPLICATE_CREATE_WINDOW_MS = 30_000;
 
 export async function POST(request: Request) {
   try {
@@ -20,12 +29,14 @@ export async function POST(request: Request) {
     if (!payload.clientId || !payload.body?.trim()) {
       return jsonError("Client and message are required");
     }
-    const messageId = makeId("msg");
+
+    const body = payload.body.trim();
+    const projectId = payload.projectId || null;
     const now = new Date().toISOString();
     const actor = actorFrom(request);
     const db = getDb();
     const client = await db
-      .select({ id: clients.id })
+      .select({ id: clients.id, status: clients.status })
       .from(clients)
       .where(
         and(
@@ -35,13 +46,15 @@ export async function POST(request: Request) {
       )
       .get();
     if (!client) return jsonError("Client not found", 404);
-    if (payload.projectId) {
-      const project = await db
-        .select({ id: projects.id })
+
+    let project: { id: string; status: string } | undefined;
+    if (projectId) {
+      project = await db
+        .select({ id: projects.id, status: projects.status })
         .from(projects)
         .where(
           and(
-            eq(projects.id, payload.projectId),
+            eq(projects.id, projectId),
             eq(projects.workspaceId, WORKSPACE_ID),
             eq(projects.clientId, payload.clientId),
           ),
@@ -49,15 +62,48 @@ export async function POST(request: Request) {
         .get();
       if (!project) return jsonError("Project not found for this client", 404);
     }
+
+    const recentMatch = await db
+      .select()
+      .from(clientMessages)
+      .where(
+        and(
+          eq(clientMessages.workspaceId, WORKSPACE_ID),
+          eq(clientMessages.clientId, payload.clientId),
+          eq(clientMessages.senderType, "owner"),
+        ),
+      )
+      .orderBy(desc(clientMessages.createdAt))
+      .get();
+    if (recentMatch) {
+      const createdAt = Date.parse(recentMatch.createdAt);
+      const isRecent =
+        Number.isFinite(createdAt) &&
+        Date.now() - createdAt >= 0 &&
+        Date.now() - createdAt <= DUPLICATE_CREATE_WINDOW_MS;
+      if (
+        isRecent &&
+        recentMatch.projectId === projectId &&
+        recentMatch.body === body
+      ) {
+        return Response.json({
+          id: recentMatch.id,
+          status: "duplicate_suppressed",
+          duplicateSuppressed: true,
+        });
+      }
+    }
+
+    const messageId = makeId("msg");
     await db.batch([
       db.insert(clientMessages).values({
         id: messageId,
         workspaceId: WORKSPACE_ID,
         clientId: payload.clientId,
-        projectId: payload.projectId || null,
+        projectId,
         senderType: "owner",
         senderId: actor,
-        body: payload.body.trim(),
+        body,
         status: "sent",
         createdAt: now,
       }),
@@ -71,30 +117,41 @@ export async function POST(request: Request) {
         targetId: payload.clientId,
         riskLevel: "medium",
         outcome: "succeeded",
-        metadataJson: JSON.stringify({ contentCaptured: false }),
+        metadataJson: JSON.stringify({
+          contentCaptured: false,
+          testData: client.status === "test" || project?.status === "test",
+        }),
         occurredAt: now,
       }),
     ]);
-    await captureAutomationSignal(
-      {
-        workspaceId: WORKSPACE_ID,
-        eventType: "owner_message_sent",
-        sourceType: "message",
-        sourceId: messageId,
-        projectId: payload.projectId || null,
-        clientId: payload.clientId,
-        category: "communication",
-        signalKey: "communication.owner_message",
-        value: {
-          direction: "outbound",
-          characterCount: payload.body.trim().length,
-          contentCaptured: false,
+
+    const isTestData = client.status === "test" || project?.status === "test";
+    if (!isTestData) {
+      await captureAutomationSignal(
+        {
+          workspaceId: WORKSPACE_ID,
+          eventType: "owner_message_sent",
+          sourceType: "message",
+          sourceId: messageId,
+          projectId,
+          clientId: payload.clientId,
+          category: "communication",
+          signalKey: "communication.owner_message",
+          value: {
+            direction: "outbound",
+            characterCount: body.length,
+            contentCaptured: false,
+          },
+          priority: 55,
         },
-        priority: 55,
-      },
-      db,
+        db,
+      );
+    }
+
+    return Response.json(
+      { id: messageId, status: isTestData ? "test_sent" : "sent" },
+      { status: 201 },
     );
-    return Response.json({ id: messageId, status: "sent" }, { status: 201 });
   } catch (error) {
     return routeError(error, "Unable to send message");
   }
