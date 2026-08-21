@@ -1,6 +1,12 @@
 import { and, eq } from "drizzle-orm";
 import { getDb } from "../../../db";
-import { approvals, assets, auditEvents, projects } from "../../../db/schema";
+import {
+  approvals,
+  assets,
+  auditEvents,
+  clients,
+  projects,
+} from "../../../db/schema";
 import { makeId, requireOwner, routeError } from "../_lib";
 import { captureAutomationSignal } from "../../../lib/automation-engine";
 
@@ -29,8 +35,14 @@ export async function POST(request: Request) {
 
     if (!payload.approvalId && payload.projectId && payload.subject?.trim()) {
       const project = await db
-        .select({ id: projects.id })
+        .select({
+          id: projects.id,
+          status: projects.status,
+          clientId: projects.clientId,
+          clientStatus: clients.status,
+        })
         .from(projects)
+        .leftJoin(clients, eq(projects.clientId, clients.id))
         .where(
           and(
             eq(projects.id, payload.projectId),
@@ -83,6 +95,30 @@ export async function POST(request: Request) {
         }
       }
 
+      const payloadHash = boundAsset?.sha256 || null;
+      if (payloadHash) {
+        const existingPending = await db
+          .select({ id: approvals.id })
+          .from(approvals)
+          .where(
+            and(
+              eq(approvals.workspaceId, DEFAULT_WORKSPACE_ID),
+              eq(approvals.projectId, payload.projectId),
+              eq(approvals.category, category),
+              eq(approvals.payloadHash, payloadHash),
+              eq(approvals.status, "pending"),
+            ),
+          )
+          .get();
+        if (existingPending) {
+          return Response.json({
+            approvalId: existingPending.id,
+            status: "duplicate_suppressed",
+            duplicateSuppressed: true,
+          });
+        }
+      }
+
       const approvalId = makeId("approval");
       const binding = boundAsset
         ? {
@@ -92,6 +128,9 @@ export async function POST(request: Request) {
             sha256: boundAsset.sha256,
           }
         : null;
+      const isTestData =
+        project.status === "test" || project.clientStatus === "test";
+
       await db.batch([
         db.insert(approvals).values({
           id: approvalId,
@@ -103,7 +142,7 @@ export async function POST(request: Request) {
           actionType: "review",
           subject: payload.subject.trim(),
           summary: payload.summary?.trim() || "Client review requested.",
-          payloadHash: boundAsset?.sha256 || approvalId,
+          payloadHash: payloadHash || approvalId,
           payloadRedactedJson: JSON.stringify(binding || {}),
           evidenceJson: JSON.stringify(
             binding
@@ -137,35 +176,41 @@ export async function POST(request: Request) {
             projectId: payload.projectId,
             assetId: boundAsset?.id || null,
             assetSha256: boundAsset?.sha256 || null,
+            testData: isTestData,
           }),
           occurredAt: now,
         }),
       ]);
-      await captureAutomationSignal(
-        {
-          workspaceId: DEFAULT_WORKSPACE_ID,
-          eventType: "approval_requested",
-          sourceType: "approval",
-          sourceId: approvalId,
-          projectId: payload.projectId,
-          category: "approval",
-          signalKey: `approval.requested:${category}`,
-          value: {
-            category,
-            riskLevel: payload.riskLevel || "medium",
-            status: "pending",
-            assetId: boundAsset?.id || null,
-            assetVersion: boundAsset?.version || null,
-            assetSha256: boundAsset?.sha256 || null,
+
+      if (!isTestData) {
+        await captureAutomationSignal(
+          {
+            workspaceId: DEFAULT_WORKSPACE_ID,
+            eventType: "approval_requested",
+            sourceType: "approval",
+            sourceId: approvalId,
+            projectId: payload.projectId,
+            clientId: project.clientId,
+            category: "approval",
+            signalKey: `approval.requested:${category}`,
+            value: {
+              category,
+              riskLevel: payload.riskLevel || "medium",
+              status: "pending",
+              assetId: boundAsset?.id || null,
+              assetVersion: boundAsset?.version || null,
+              assetSha256: boundAsset?.sha256 || null,
+            },
+            priority: 85,
           },
-          priority: 85,
-        },
-        db,
-      );
+          db,
+        );
+      }
+
       return Response.json(
         {
           approvalId,
-          status: "pending",
+          status: isTestData ? "test_pending" : "pending",
           binding,
         },
         { status: 201 },
@@ -203,6 +248,27 @@ export async function POST(request: Request) {
       );
     }
 
+    const projectContext = existing.projectId
+      ? await db
+          .select({
+            projectStatus: projects.status,
+            clientStatus: clients.status,
+            clientId: projects.clientId,
+          })
+          .from(projects)
+          .leftJoin(clients, eq(projects.clientId, clients.id))
+          .where(
+            and(
+              eq(projects.id, existing.projectId),
+              eq(projects.workspaceId, DEFAULT_WORKSPACE_ID),
+            ),
+          )
+          .get()
+      : null;
+    const isTestData =
+      projectContext?.projectStatus === "test" ||
+      projectContext?.clientStatus === "test";
+
     await db.batch([
       db
         .update(approvals)
@@ -234,28 +300,33 @@ export async function POST(request: Request) {
           category: existing.category,
           subject: existing.subject,
           payloadHash: existing.payloadHash,
+          testData: isTestData,
         }),
       }),
     ]);
-    await captureAutomationSignal(
-      {
-        workspaceId: DEFAULT_WORKSPACE_ID,
-        eventType: "approval_decided",
-        sourceType: "approval",
-        sourceId: existing.id,
-        projectId: existing.projectId,
-        category: "approval",
-        signalKey: `approval.decision:${payload.decision}`,
-        value: {
-          category: existing.category,
-          riskLevel: existing.riskLevel,
-          decision: payload.decision,
-          payloadHash: existing.payloadHash,
+
+    if (!isTestData) {
+      await captureAutomationSignal(
+        {
+          workspaceId: DEFAULT_WORKSPACE_ID,
+          eventType: "approval_decided",
+          sourceType: "approval",
+          sourceId: existing.id,
+          projectId: existing.projectId,
+          clientId: projectContext?.clientId ?? null,
+          category: "approval",
+          signalKey: `approval.decision:${payload.decision}`,
+          value: {
+            category: existing.category,
+            riskLevel: existing.riskLevel,
+            decision: payload.decision,
+            payloadHash: existing.payloadHash,
+          },
+          priority: 80,
         },
-        priority: 80,
-      },
-      db,
-    );
+        db,
+      );
+    }
 
     return Response.json({
       approvalId: payload.approvalId,
