@@ -1,7 +1,7 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 import { env } from "cloudflare:workers";
 import { getDb } from "../../../db";
-import { assets, auditEvents, projects } from "../../../db/schema";
+import { approvals, assets, auditEvents, projects } from "../../../db/schema";
 import { captureAutomationSignal } from "../../../lib/automation-engine";
 import {
   actorFrom,
@@ -18,6 +18,15 @@ type StoredObject = {
   body: BodyInit;
   httpMetadata?: { contentType?: string };
 };
+
+function approvalBindsAsset(payloadRedactedJson: string, assetId: string) {
+  try {
+    const payload = JSON.parse(payloadRedactedJson) as { assetId?: unknown };
+    return payload?.assetId === assetId;
+  } catch {
+    return false;
+  }
+}
 
 export async function POST(request: Request) {
   try {
@@ -144,7 +153,13 @@ export async function GET(request: Request) {
     const row = await db
       .select()
       .from(assets)
-      .where(and(eq(assets.id, assetId), eq(assets.workspaceId, WORKSPACE_ID)))
+      .where(
+        and(
+          eq(assets.id, assetId),
+          eq(assets.workspaceId, WORKSPACE_ID),
+          isNull(assets.deletedAt),
+        ),
+      )
       .get();
     if (!row) return jsonError("File not found", 404);
     const clientAccess = await resolveClientAccess(request, token);
@@ -152,10 +167,41 @@ export async function GET(request: Request) {
       if (row.clientId !== clientAccess.clientId) {
         return jsonError("Portal access is invalid or expired", 401);
       }
-      // Owner uploads are private by default. A later explicit share/version
-      // binding flow can expose a specific immutable owner asset to the client.
+
       if (row.sourceType !== "client_upload") {
-        return jsonError("This file has not been shared with the client", 403);
+        if (!row.projectId) {
+          return jsonError("This file has not been shared with the client", 403);
+        }
+        const project = await db
+          .select({ id: projects.id, clientId: projects.clientId })
+          .from(projects)
+          .where(
+            and(
+              eq(projects.id, row.projectId),
+              eq(projects.workspaceId, clientAccess.workspaceId),
+              eq(projects.clientId, clientAccess.clientId),
+            ),
+          )
+          .get();
+        if (!project) {
+          return jsonError("This file has not been shared with the client", 403);
+        }
+
+        const approvalRows = await db
+          .select({ payloadRedactedJson: approvals.payloadRedactedJson })
+          .from(approvals)
+          .where(
+            and(
+              eq(approvals.workspaceId, clientAccess.workspaceId),
+              eq(approvals.projectId, row.projectId),
+            ),
+          );
+        const explicitlyShared = approvalRows.some((approval) =>
+          approvalBindsAsset(approval.payloadRedactedJson, row.id),
+        );
+        if (!explicitlyShared) {
+          return jsonError("This file has not been shared with the client", 403);
+        }
       }
     } else {
       await requireOwner(request);
