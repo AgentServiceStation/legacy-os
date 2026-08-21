@@ -20,6 +20,8 @@ import {
 } from "../_lib";
 import { captureAutomationSignal } from "../../../lib/automation-engine";
 
+const DUPLICATE_CREATE_WINDOW_MS = 30_000;
+
 type ApprovalBinding = {
   assetId: string;
   originalName?: string;
@@ -286,16 +288,31 @@ export async function POST(request: Request) {
     if (!access) return jsonError("Portal access is invalid or expired", 401);
     const db = getDb();
     const now = new Date().toISOString();
+    const client = await db
+      .select({ id: clients.id, status: clients.status })
+      .from(clients)
+      .where(
+        and(
+          eq(clients.id, access.clientId),
+          eq(clients.workspaceId, access.workspaceId),
+        ),
+      )
+      .get();
+    if (!client) return jsonError("Client not found", 404);
 
     if (payload.action === "message") {
-      if (!payload.body?.trim()) return jsonError("Message cannot be empty");
-      if (payload.projectId) {
-        const project = await db
-          .select({ id: projects.id })
+      const body = payload.body?.trim() || "";
+      if (!body) return jsonError("Message cannot be empty");
+
+      const projectId = payload.projectId || null;
+      let project: { id: string; status: string } | undefined;
+      if (projectId) {
+        project = await db
+          .select({ id: projects.id, status: projects.status })
           .from(projects)
           .where(
             and(
-              eq(projects.id, payload.projectId),
+              eq(projects.id, projectId),
               eq(projects.clientId, access.clientId),
               eq(projects.workspaceId, access.workspaceId),
             ),
@@ -303,53 +320,95 @@ export async function POST(request: Request) {
           .get();
         if (!project) return jsonError("Project not found", 404);
       }
+
+      const recentMatch = await db
+        .select()
+        .from(clientMessages)
+        .where(
+          and(
+            eq(clientMessages.workspaceId, access.workspaceId),
+            eq(clientMessages.clientId, access.clientId),
+            eq(clientMessages.senderType, "client"),
+          ),
+        )
+        .orderBy(desc(clientMessages.createdAt))
+        .get();
+      if (recentMatch) {
+        const createdAt = Date.parse(recentMatch.createdAt);
+        const isRecent =
+          Number.isFinite(createdAt) &&
+          Date.now() - createdAt >= 0 &&
+          Date.now() - createdAt <= DUPLICATE_CREATE_WINDOW_MS;
+        if (
+          isRecent &&
+          recentMatch.projectId === projectId &&
+          recentMatch.body === body
+        ) {
+          return Response.json({
+            id: recentMatch.id,
+            status: "duplicate_suppressed",
+            duplicateSuppressed: true,
+          });
+        }
+      }
+
       const messageId = makeId("msg");
+      const isTestData = client.status === "test" || project?.status === "test";
       await db.batch([
         db.insert(clientMessages).values({
           id: messageId,
-          workspaceId: WORKSPACE_ID,
+          workspaceId: access.workspaceId,
           clientId: access.clientId,
-          projectId: payload.projectId || null,
+          projectId,
           senderType: "client",
           senderId: access.clientId,
-          body: payload.body.trim(),
+          body,
           status: "sent",
           createdAt: now,
         }),
         db.insert(auditEvents).values({
           id: makeId("audit"),
-          workspaceId: WORKSPACE_ID,
+          workspaceId: access.workspaceId,
           actorType: "client",
           actorId: access.clientId,
           action: "portal.message_sent",
           targetType: "project",
-          targetId: payload.projectId || null,
+          targetId: projectId,
           riskLevel: "low",
           outcome: "succeeded",
-          metadataJson: JSON.stringify({ contentCaptured: false }),
+          metadataJson: JSON.stringify({
+            contentCaptured: false,
+            testData: isTestData,
+          }),
           occurredAt: now,
         }),
       ]);
-      await captureAutomationSignal(
-        {
-          workspaceId: WORKSPACE_ID,
-          eventType: "client_message_received",
-          sourceType: "message",
-          sourceId: messageId,
-          projectId: payload.projectId || null,
-          clientId: access.clientId,
-          category: "communication",
-          signalKey: "communication.client_message",
-          value: {
-            direction: "inbound",
-            characterCount: payload.body.trim().length,
-            contentCaptured: false,
+
+      if (!isTestData) {
+        await captureAutomationSignal(
+          {
+            workspaceId: access.workspaceId,
+            eventType: "client_message_received",
+            sourceType: "message",
+            sourceId: messageId,
+            projectId,
+            clientId: access.clientId,
+            category: "communication",
+            signalKey: "communication.client_message",
+            value: {
+              direction: "inbound",
+              characterCount: body.length,
+              contentCaptured: false,
+            },
+            priority: 90,
           },
-          priority: 90,
-        },
-        db,
+          db,
+        );
+      }
+      return Response.json(
+        { id: messageId, status: isTestData ? "test_sent" : "sent" },
+        { status: 201 },
       );
-      return Response.json({ id: messageId, status: "sent" }, { status: 201 });
     }
 
     if (payload.action === "approval") {
@@ -364,7 +423,9 @@ export async function POST(request: Request) {
           id: approvals.id,
           projectId: approvals.projectId,
           status: approvals.status,
+          payloadHash: approvals.payloadHash,
           clientId: projects.clientId,
+          projectStatus: projects.status,
         })
         .from(approvals)
         .leftJoin(projects, eq(approvals.projectId, projects.id))
@@ -381,6 +442,9 @@ export async function POST(request: Request) {
       if (approval.status !== "pending") {
         return jsonError("This approval has already been decided", 409);
       }
+
+      const isTestData =
+        client.status === "test" || approval.projectStatus === "test";
       await db.batch([
         db
           .update(approvals)
@@ -391,10 +455,15 @@ export async function POST(request: Request) {
             decidedAt: now,
             updatedAt: now,
           })
-          .where(eq(approvals.id, payload.approvalId)),
+          .where(
+            and(
+              eq(approvals.id, payload.approvalId),
+              eq(approvals.status, "pending"),
+            ),
+          ),
         db.insert(auditEvents).values({
           id: makeId("audit"),
-          workspaceId: WORKSPACE_ID,
+          workspaceId: access.workspaceId,
           actorType: "client",
           actorId: access.clientId,
           action: `approval.${payload.decision}`,
@@ -402,28 +471,35 @@ export async function POST(request: Request) {
           targetId: payload.approvalId,
           riskLevel: "medium",
           outcome: "succeeded",
-          metadataJson: "{}",
+          metadataJson: JSON.stringify({
+            payloadHash: approval.payloadHash,
+            testData: isTestData,
+          }),
           occurredAt: now,
         }),
       ]);
-      await captureAutomationSignal(
-        {
-          workspaceId: WORKSPACE_ID,
-          eventType: "approval_decided",
-          sourceType: "approval",
-          sourceId: approval.id,
-          projectId: approval.projectId,
-          clientId: access.clientId,
-          category: "approval",
-          signalKey: `approval.client_decision:${payload.decision}`,
-          value: {
-            decision: payload.decision,
-            decisionBy: "client",
+
+      if (!isTestData) {
+        await captureAutomationSignal(
+          {
+            workspaceId: access.workspaceId,
+            eventType: "approval_decided",
+            sourceType: "approval",
+            sourceId: approval.id,
+            projectId: approval.projectId,
+            clientId: access.clientId,
+            category: "approval",
+            signalKey: `approval.client_decision:${payload.decision}`,
+            value: {
+              decision: payload.decision,
+              decisionBy: "client",
+              payloadHash: approval.payloadHash,
+            },
+            priority: 95,
           },
-          priority: 95,
-        },
-        db,
-      );
+          db,
+        );
+      }
       return Response.json({ status: payload.decision });
     }
 
