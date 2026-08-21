@@ -7,6 +7,7 @@ export async function POST(request: Request) {
   try {
     await requireOwner(request);
     const payload = (await request.json()) as {
+      displayName?: string;
       firstName?: string;
       lastName?: string;
       email?: string;
@@ -14,9 +15,16 @@ export async function POST(request: Request) {
       preferredChannel?: string;
       notes?: string;
     };
-    if (!payload.firstName?.trim() || !payload.lastName?.trim()) {
-      return jsonError("First and last name are required");
+
+    // Tattoo inquiries often arrive before a legal/full name is known. Keep the
+    // current schema compatible by storing an unknown surname as an empty string,
+    // while allowing a temporary/display label in the first-name slot.
+    const firstName = payload.firstName?.trim() || payload.displayName?.trim() || "";
+    const lastName = payload.lastName?.trim() || "";
+    if (!firstName) {
+      return jsonError("A client name or temporary label is required");
     }
+
     const clientId = makeId("cli");
     const actor = actorFrom(request);
     const now = new Date().toISOString();
@@ -25,11 +33,11 @@ export async function POST(request: Request) {
       db.insert(clients).values({
         id: clientId,
         workspaceId: WORKSPACE_ID,
-        firstName: payload.firstName.trim(),
-        lastName: payload.lastName.trim(),
+        firstName,
+        lastName,
         email: payload.email?.trim() || null,
         phone: payload.phone?.trim() || null,
-        preferredChannel: payload.preferredChannel || "email",
+        preferredChannel: payload.preferredChannel?.trim() || "unknown",
         notes: payload.notes?.trim() || null,
         createdAt: now,
         updatedAt: now,
@@ -44,7 +52,7 @@ export async function POST(request: Request) {
         targetId: clientId,
         riskLevel: "low",
         outcome: "succeeded",
-        metadataJson: "{}",
+        metadataJson: JSON.stringify({ identityCompleteness: lastName ? "partial_or_full" : "temporary" }),
         occurredAt: now,
       }),
     ]);
@@ -58,9 +66,11 @@ export async function POST(request: Request) {
         category: "inquiry",
         signalKey: "client.inquiry_created",
         value: {
-          preferredChannel: payload.preferredChannel || "email",
+          preferredChannel: payload.preferredChannel?.trim() || "unknown",
           hasEmail: Boolean(payload.email?.trim()),
           hasPhone: Boolean(payload.phone?.trim()),
+          hasLastName: Boolean(lastName),
+          temporaryIdentity: !lastName,
         },
         priority: 80,
       },
