@@ -52,8 +52,14 @@ export async function GET(request: Request) {
         } else if (row.eventType === "refund") {
           result.refundCents += row.amountCents;
         }
-        if (row.eventType === "quote") result.latestQuoteCents = row.amountCents;
-        if (row.eventType === "estimate") result.latestEstimateCents = row.amountCents;
+        // Rows are newest-first. Keep the first matching planning value instead
+        // of overwriting it with an older quote/estimate later in the reduce.
+        if (row.eventType === "quote" && result.latestQuoteCents === null) {
+          result.latestQuoteCents = row.amountCents;
+        }
+        if (row.eventType === "estimate" && result.latestEstimateCents === null) {
+          result.latestEstimateCents = row.amountCents;
+        }
         return result;
       },
       {
