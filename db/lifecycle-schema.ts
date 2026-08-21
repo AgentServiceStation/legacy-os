@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import { index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 import {
   appointments,
@@ -7,7 +8,8 @@ import {
   workspaces,
 } from "./schema";
 
-const timestamp = (name: string) => text(name).notNull().default("CURRENT_TIMESTAMP");
+const timestamp = (name: string) =>
+  text(name).notNull().default(sql`CURRENT_TIMESTAMP`);
 
 /**
  * One project may contain multiple tattoo sessions. Structured JSON fields keep
