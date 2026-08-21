@@ -1,9 +1,31 @@
-import { and, eq } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import { getDb } from "../../../db";
 import { auditEvents, clients, projects } from "../../../db/schema";
-import { actorFrom, jsonError, makeId, requireOwner, routeError, WORKSPACE_ID } from "../_lib";
+import {
+  actorFrom,
+  jsonError,
+  makeId,
+  requireOwner,
+  routeError,
+  WORKSPACE_ID,
+} from "../_lib";
 import { captureCompletedProject } from "../../../lib/intelligence-engine";
 import { captureAutomationSignal } from "../../../lib/automation-engine";
+
+const DUPLICATE_CREATE_WINDOW_MS = 30_000;
+
+function normalizeTags(style?: string) {
+  return (
+    style
+      ?.split(",")
+      .map((tag) => tag.trim())
+      .filter(Boolean) ?? []
+  );
+}
+
+function sameNullableText(left: string | null, right: string | null) {
+  return (left ?? null) === (right ?? null);
+}
 
 export async function POST(request: Request) {
   try {
@@ -22,6 +44,7 @@ export async function POST(request: Request) {
     if (!payload.clientId || !payload.title?.trim()) {
       return jsonError("A client and project title are required");
     }
+
     const db = getDb();
     const client = await db
       .select({ id: clients.id })
@@ -35,6 +58,63 @@ export async function POST(request: Request) {
       .get();
     if (!client) return jsonError("Client not found", 404);
 
+    const title = payload.title.trim();
+    const placement = payload.placement?.trim() || null;
+    const styleTags = normalizeTags(payload.style);
+    const styleTagsJson = JSON.stringify(styleTags);
+    const summary = payload.summary?.trim() || null;
+    const budgetMinCents =
+      typeof payload.budgetMin === "number"
+        ? Math.round(payload.budgetMin * 100)
+        : null;
+    const budgetMaxCents =
+      typeof payload.budgetMax === "number"
+        ? Math.round(payload.budgetMax * 100)
+        : null;
+    const targetDate = payload.targetDate || null;
+    const nextAction = payload.nextAction?.trim() || "Complete project intake";
+
+    // Mobile double taps, browser retries, and slow network responses must not
+    // create a second business record. Suppress only a very recent project
+    // whose meaningful creation payload matches exactly; legitimate later work
+    // with the same title remains possible.
+    const recentMatch = await db
+      .select()
+      .from(projects)
+      .where(
+        and(
+          eq(projects.workspaceId, WORKSPACE_ID),
+          eq(projects.clientId, payload.clientId),
+          eq(projects.title, title),
+        ),
+      )
+      .orderBy(desc(projects.createdAt))
+      .get();
+
+    if (recentMatch) {
+      const createdAtMs = Date.parse(recentMatch.createdAt);
+      const isRecent =
+        Number.isFinite(createdAtMs) &&
+        Date.now() - createdAtMs >= 0 &&
+        Date.now() - createdAtMs <= DUPLICATE_CREATE_WINDOW_MS;
+      const samePayload =
+        sameNullableText(recentMatch.placement, placement) &&
+        recentMatch.styleTagsJson === styleTagsJson &&
+        sameNullableText(recentMatch.summary, summary) &&
+        recentMatch.budgetMinCents === budgetMinCents &&
+        recentMatch.budgetMaxCents === budgetMaxCents &&
+        sameNullableText(recentMatch.targetDate, targetDate) &&
+        sameNullableText(recentMatch.nextAction, nextAction);
+
+      if (isRecent && samePayload) {
+        return Response.json({
+          id: recentMatch.id,
+          status: "duplicate_suppressed",
+          duplicateSuppressed: true,
+        });
+      }
+    }
+
     const projectId = makeId("prj");
     const actor = actorFrom(request);
     const now = new Date().toISOString();
@@ -43,26 +123,15 @@ export async function POST(request: Request) {
         id: projectId,
         workspaceId: WORKSPACE_ID,
         clientId: payload.clientId,
-        title: payload.title.trim(),
+        title,
         lifecyclePhase: "consult",
-        placement: payload.placement?.trim() || null,
-        styleTagsJson: JSON.stringify(
-          payload.style
-            ?.split(",")
-            .map((tag) => tag.trim())
-            .filter(Boolean) ?? [],
-        ),
-        summary: payload.summary?.trim() || null,
-        budgetMinCents:
-          typeof payload.budgetMin === "number"
-            ? Math.round(payload.budgetMin * 100)
-            : null,
-        budgetMaxCents:
-          typeof payload.budgetMax === "number"
-            ? Math.round(payload.budgetMax * 100)
-            : null,
-        targetDate: payload.targetDate || null,
-        nextAction: payload.nextAction?.trim() || "Complete project intake",
+        placement,
+        styleTagsJson,
+        summary,
+        budgetMinCents,
+        budgetMaxCents,
+        targetDate,
+        nextAction,
         createdAt: now,
         updatedAt: now,
       }),
@@ -92,12 +161,8 @@ export async function POST(request: Request) {
         signalKey: "project.created",
         value: {
           lifecyclePhase: "consult",
-          placement: payload.placement?.trim() || null,
-          styleTags:
-            payload.style
-              ?.split(",")
-              .map((tag) => tag.trim())
-              .filter(Boolean) ?? [],
+          placement,
+          styleTags,
         },
       },
       db,
@@ -122,9 +187,14 @@ export async function PATCH(request: Request) {
     if (!payload.id) return jsonError("Project id is required");
     if (
       payload.lifecyclePhase &&
-      !["consult", "design", "approval", "session", "healing", "complete"].includes(
-        payload.lifecyclePhase,
-      )
+      ![
+        "consult",
+        "design",
+        "approval",
+        "session",
+        "healing",
+        "complete",
+      ].includes(payload.lifecyclePhase)
     ) {
       return jsonError("Lifecycle phase is invalid");
     }
